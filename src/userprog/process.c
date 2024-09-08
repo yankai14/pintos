@@ -20,6 +20,14 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
+#define ARG_SIZE 128
+
+typedef struct {
+  char* file_name;
+  char** argv;
+  int argc;
+} FunctionSignature;
+
 static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
@@ -77,6 +85,22 @@ static void start_process(void* file_name_) {
   struct intr_frame if_;
   bool success, pcb_success;
 
+  // Tokenize the args
+  char* argv[ARG_SIZE];
+  char* saveptr = argv;
+  const char* delim = " ";
+  char* token = strtok_r(file_name, delim, &saveptr);
+  int argc = 0;
+  FunctionSignature* fs = malloc(sizeof(FunctionSignature));
+
+  while (token != NULL) {
+    argv[argc++] = token;
+    token = strtok_r(NULL, delim, &saveptr);
+  }
+  fs->file_name = file_name;
+  fs->argv = argv;
+  fs->argc = argc;
+
   /* Allocate process control block */
   struct process* new_pcb = malloc(sizeof(struct process));
   success = pcb_success = new_pcb != NULL;
@@ -99,7 +123,7 @@ static void start_process(void* file_name_) {
     if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
-    success = load(file_name, &if_.eip, &if_.esp);
+    success = load(fs->file_name, &if_.eip, &if_.esp);
     if_.esp = if_.esp - 12;
   }
 
@@ -113,8 +137,10 @@ static void start_process(void* file_name_) {
     free(pcb_to_free);
   }
 
+  if (success) function_call_setup(fs, &if_.esp);
+
   /* Clean up. Exit on failure or jump to userspace */
-  palloc_free_page(file_name);
+  palloc_free_page(fs->file_name);
   if (!success) {
     sema_up(&temporary);
     thread_exit();
@@ -128,6 +154,53 @@ static void start_process(void* file_name_) {
      and jump to it. */
   asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
   NOT_REACHED();
+}
+
+/* Argument passing as part of the function call setup. The procedure
+for populating a stack is as follows
+  1. Push arguments to the stack
+  2. Push arguments pointers/addresses to the stack
+  3. Push NULL pointer sentinel to the stack
+  4. Push return address to the stack
+*/
+void function_call_setup(FunctionSignature* fs, void** esp) {
+  // Push args from right to left to stack first (actually doesnt matter as
+  // we are referencing the args using pointers)
+  // At the same time we save the addresses
+  char* argv_addresses[fs->argc + 1];
+  argv_addresses[fs->argc] = NULL;
+  for (int i=fs->argc-1; i>=0; i--) {
+    size_t arg_size = strlen(fs->argv[i]) + 1;
+    *esp -= arg_size; // Allocate space for memcpy
+    memcpy(*esp, fs->argv[i], arg_size);
+    argv_addresses[i] = (char *) *esp;
+  }
+
+  // Align stack pointer for 32-bit address alignment (4 bytes)
+  size_t alignment = ((size_t)*esp % 4);
+  if (alignment != 0) {
+    *esp -= alignment;
+    memset(*esp, 0, alignment); // Optionally clear the added space
+  }
+
+  // Push addresses of arguments (argv[])
+  size_t argv_addresses_size = (fs->argc + 1) * sizeof(char*);
+  *esp -= argv_addresses_size;
+  memcpy(*esp, argv_addresses, argv_addresses_size);
+
+  // Push argv address
+  // 0xbfffffe1
+  *esp -= 4;
+  *((char ***) (*esp)) = *esp + 4;
+
+  // Push argc address
+  *esp -= 4;
+  *((int *) *esp) = fs->argc;
+
+  // Push return address
+  size_t fake_ra = 0;
+  *esp -= 4;
+  memcpy(*esp, &fake_ra, 4);
 }
 
 /* Waits for process with PID child_pid to die and returns its exit status.
