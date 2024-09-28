@@ -4,6 +4,7 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "userprog/process.h"
+#include "devices/shutdown.h"
 
 static void syscall_handler(struct intr_frame*);
 
@@ -25,5 +26,13 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     f->eax = args[1];
     printf("%s: exit(%d)\n", thread_current()->pcb->process_name, args[1]);
     process_exit();
+  } else if (args[0] == SYS_PRACTICE) {
+    f->eax = args[1] + 1;
+  } else if (args[0] == SYS_HALT) {
+    shutdown_power_off();
+  } else if (args[0] == SYS_EXEC) {
+    process_execute((char*) args[1]);
+  } else if (args[0] == SYS_WAIT) {
+    f->eax = process_wait(args[1]);
   }
 }

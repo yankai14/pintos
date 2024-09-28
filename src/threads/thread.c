@@ -191,6 +191,9 @@ tid_t thread_create(const char* name, int priority, thread_func* function, void*
   init_thread(t, name, priority);
   tid = t->tid = allocate_tid();
 
+  /* Add to current thread children list */
+  list_push_back(&thread_current()->children, &t->elem);
+
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame(t, sizeof *kf);
   kf->eip = NULL;
@@ -292,6 +295,10 @@ void thread_exit(void) {
      and schedule another process.  That process will destroy us
      when it calls thread_switch_tail(). */
   intr_disable();
+  while(!list_empty(&thread_current()->children)) {
+    struct list_elem* e = list_pop_back(&thread_current()->children);
+    free(list_entry(e, struct thread, elem));
+  }
   list_remove(&thread_current()->allelem);
   thread_current()->status = THREAD_DYING;
   schedule();
@@ -353,6 +360,14 @@ int thread_get_load_avg(void) {
 int thread_get_recent_cpu(void) {
   /* Not yet implemented. */
   return 0;
+}
+
+struct thread* thread_find_child(struct thread* parent, tid_t tid) {
+  for (struct list_elem* ele = list_begin(&parent->children); ele != list_end(&parent->children); list_next(ele)) {
+    struct thread* t = list_entry(ele, struct thread, elem);
+    if (t->tid == tid) return t;
+  }
+  return NULL;
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -430,6 +445,7 @@ static void init_thread(struct thread* t, const char* name, int priority) {
   t->priority = priority;
   t->pcb = NULL;
   t->magic = THREAD_MAGIC;
+  list_init(&t->children);
 
   old_level = intr_disable();
   list_push_back(&all_list, &t->allelem);

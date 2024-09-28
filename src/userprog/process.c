@@ -22,13 +22,14 @@
 
 #define ARG_SIZE 128
 
-typedef struct {
-  char* file_name;
-  char** argv;
-  int argc;
-} FunctionSignature;
+struct start_process_args {
+  char* fn_signature;
 
-static struct semaphore temporary;
+  /* Semaphore to track the success of the process */
+  struct semaphore init_mutex;
+  bool success;
+};
+
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
@@ -49,6 +50,8 @@ void userprog_init(void) {
      can come at any time and activate our pagedir */
   t->pcb = calloc(sizeof(struct process), 1);
   success = t->pcb != NULL;
+  t->pcb->parent_pid = -1; // The main thread should have no parent (Hence a pid of -1)
+  sema_init(&t->pcb->wait_sem, 0);
 
   /* Kill the kernel if we did not succeed */
   ASSERT(success);
@@ -60,9 +63,7 @@ void userprog_init(void) {
    process id, or TID_ERROR if the thread cannot be created. */
 pid_t process_execute(const char* file_name) {
   char* fn_copy;
-  tid_t tid;
-
-  sema_init(&temporary, 0);
+  pid_t pid;
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page(0);
@@ -70,17 +71,41 @@ pid_t process_execute(const char* file_name) {
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
 
+  /* Init start_process args. Set the success value to false first and init the monitor construct */
+  struct start_process_args* args = malloc(sizeof(struct start_process_args));
+  sema_init(&args->init_mutex, 0);
+  args->fn_signature = fn_copy;
+  args->success = false;
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
+  pid = thread_create(file_name, PRI_DEFAULT, start_process, args);
+  if (pid == TID_ERROR)
     palloc_free_page(fn_copy);
-  return tid;
+
+  /* Since the start_process function loads the pcb in a different kernel thread
+    we need to block until we are done loading the process.
+  */
+  struct thread* child = thread_find_child(thread_current(), pid);
+  ASSERT(child);
+  /* We will block here until the start_process condition signal us */
+  sema_down(&args->init_mutex);
+  if (args->success) {
+    struct thread* cur_thread = thread_current();
+    if (args->success) process_set_child(cur_thread->pcb, child->pcb);
+     /* We have one more child thread that is running so decrement the semaphore */
+    sema_down(&cur_thread->pcb->wait_sem);
+  }
+
+  /* Clean up the dynamic memory allocated by heap */
+  free(args);
+  return args->success ? pid: -1;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process(void* file_name_) {
-  char* file_name = (char*)file_name_;
+static void start_process(void* args_) {
+  struct start_process_args* args = (struct start_process_args*) args_;
+  char* file_name = args->fn_signature;
   struct thread* t = thread_current();
   struct intr_frame if_;
   bool success, pcb_success;
@@ -91,7 +116,7 @@ static void start_process(void* file_name_) {
   const char* delim = " ";
   char* token = strtok_r(file_name, delim, &saveptr);
   int argc = 0;
-  FunctionSignature* fs = malloc(sizeof(FunctionSignature));
+  struct function_signature* fs = malloc(sizeof(struct function_signature));
 
   while (token != NULL) {
     argv[argc++] = token;
@@ -115,6 +140,8 @@ static void start_process(void* file_name_) {
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
     strlcpy(t->pcb->process_name, t->name, sizeof t->name);
+    t->pcb->pid = t->tid; // Set the pid of the process
+    sema_init(&t->pcb->wait_sem, 0);
   }
 
   /* Initialize interrupt frame and load executable. */
@@ -142,9 +169,13 @@ static void start_process(void* file_name_) {
   /* Clean up. Exit on failure or jump to userspace */
   palloc_free_page(fs->file_name);
   if (!success) {
-    sema_up(&temporary);
+    sema_up(&t->pcb->wait_sem);
+    sema_up(&args->init_mutex);
     thread_exit();
   }
+
+  args->success = success;
+  sema_up(&args->init_mutex);
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -163,7 +194,7 @@ for populating a stack is as follows
   3. Push NULL pointer sentinel to the stack
   4. Push return address to the stack
 */
-void function_call_setup(FunctionSignature* fs, void** esp) {
+void function_call_setup(struct function_signature* fs, void** esp) {
   // Push args from right to left to stack first (actually doesnt matter as
   // we are referencing the args using pointers)
   // At the same time we save the addresses
@@ -212,9 +243,28 @@ void function_call_setup(FunctionSignature* fs, void** esp) {
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-int process_wait(pid_t child_pid UNUSED) {
-  sema_down(&temporary);
-  return 0;
+int process_wait(pid_t child_pid) {
+  struct thread* child = thread_find_child(thread_current(), child_pid);
+  if (!child) return EXIT_PROCESS_NOT_FOUND;
+  if (!process_is_child(thread_current(), child_pid)) return EXIT_PROCESS_NOT_FOUND;
+  if (!child->pcb) return EXIT_PROCESS_NOT_FOUND;
+
+  int status = EXIT_PROCESS_FAILURE;
+  
+  /* See if the process has completed using semaphores */
+  sema_down(&child->pcb->wait_sem);
+
+  /* The child, currently a zombie process, returns the status
+    to the parent. The parent will then clean up the child.
+  */
+  status = child->pcb->exit_status;
+
+  /* Free the PCB of this process */
+  struct process* pcb_to_free = child->pcb;
+  child->pcb = NULL;
+  free(pcb_to_free);
+
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -244,15 +294,13 @@ void process_exit(void) {
     pagedir_destroy(pd);
   }
 
-  /* Free the PCB of this process and kill this thread
-     Avoid race where PCB is freed before t->pcb is set to NULL
-     If this happens, then an unfortuantely timed timer interrupt
-     can try to activate the pagedir, but it is now freed memory */
-  struct process* pcb_to_free = cur->pcb;
-  cur->pcb = NULL;
-  free(pcb_to_free);
+  /* Increment semaphore to signal that the process is done */
+  sema_up(&cur->pcb->wait_sem);
 
-  sema_up(&temporary);
+  /* Here the child becomes a zombie process where its data structs
+    eg PCB, TCB will be cleaned up by parent in the process_wait 
+    syscall
+  */
   thread_exit();
 }
 
@@ -571,6 +619,12 @@ static bool install_page(void* upage, void* kpage, bool writable) {
   return (pagedir_get_page(t->pcb->pagedir, upage) == NULL &&
           pagedir_set_page(t->pcb->pagedir, upage, kpage, writable));
 }
+
+/* Set the child of a given process */
+void process_set_child(struct process* parent, struct process* child) { parent->parent_pid = child->pid; }
+
+/* Check if the pid given is a child process of a given process */
+bool process_is_child(struct process* child, struct process* parent) { return child->parent_pid == parent->pid; }
 
 /* Returns true if t is the main thread of the process p */
 bool is_main_thread(struct thread* t, struct process* p) { return p->main_thread == t; }
