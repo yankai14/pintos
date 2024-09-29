@@ -90,6 +90,8 @@ struct thread {
   int priority;              /* Priority. */
   struct list_elem allelem;  /* List element for all threads list. */
   struct list children;      /* Children of threads */
+  struct list_elem c_elem;  /* List element for children list */
+  struct thread* parent;      /* Parent of thread */
 
   /* Shared between thread.c and synch.c. */
   struct list_elem elem; /* List element. */

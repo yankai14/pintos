@@ -39,6 +39,8 @@ struct process {
 	pid_t parent_pid;															/* Parent pid of the process */
 	enum process_exit_status exit_status;        	/* Exit status of a process */
   struct semaphore wait_sem;                 		/* Semaphore. Blocks until all child threads exits */
+	struct list children;													/* Children processes. Different from children threads */
+	struct list_elem elem;												/* List elem */
 };
 
 struct function_signature {
@@ -55,6 +57,7 @@ void process_exit(void);
 void process_activate(void);
 void process_set_child(struct process* parent, struct process* child);
 bool process_is_child(struct process* child, struct process* parent);
+struct process* process_find_child(struct process* parent, pid_t child_pid);
 
 bool is_main_thread(struct thread*, struct process*);
 pid_t get_pid(struct process*);

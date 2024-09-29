@@ -192,7 +192,8 @@ tid_t thread_create(const char* name, int priority, thread_func* function, void*
   tid = t->tid = allocate_tid();
 
   /* Add to current thread children list */
-  list_push_back(&thread_current()->children, &t->elem);
+  list_push_back(&thread_current()->children, &t->c_elem);
+  t->parent = thread_current();
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame(t, sizeof *kf);
@@ -295,10 +296,7 @@ void thread_exit(void) {
      and schedule another process.  That process will destroy us
      when it calls thread_switch_tail(). */
   intr_disable();
-  while(!list_empty(&thread_current()->children)) {
-    struct list_elem* e = list_pop_back(&thread_current()->children);
-    free(list_entry(e, struct thread, elem));
-  }
+  list_remove(&thread_current()->c_elem);
   list_remove(&thread_current()->allelem);
   thread_current()->status = THREAD_DYING;
   schedule();
@@ -363,7 +361,7 @@ int thread_get_recent_cpu(void) {
 }
 
 struct thread* thread_find_child(struct thread* parent, tid_t tid) {
-  for (struct list_elem* ele = list_begin(&parent->children); ele != list_end(&parent->children); list_next(ele)) {
+  for (struct list_elem* ele = list_begin(&parent->children); ele != list_end(&parent->children); ele = list_next(ele)) {
     struct thread* t = list_entry(ele, struct thread, elem);
     if (t->tid == tid) return t;
   }

@@ -23,15 +23,16 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
   /* printf("System call number: %d\n", args[0]); */
 
   if (args[0] == SYS_EXIT) {
-    f->eax = args[1];
+    thread_current()->pcb->exit_status = args[1];
     printf("%s: exit(%d)\n", thread_current()->pcb->process_name, args[1]);
     process_exit();
+    thread_exit();
   } else if (args[0] == SYS_PRACTICE) {
     f->eax = args[1] + 1;
   } else if (args[0] == SYS_HALT) {
     shutdown_power_off();
   } else if (args[0] == SYS_EXEC) {
-    process_execute((char*) args[1]);
+    f->eax = process_execute((char*) args[1]);
   } else if (args[0] == SYS_WAIT) {
     f->eax = process_wait(args[1]);
   }

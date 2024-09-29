@@ -25,6 +25,8 @@
 struct start_process_args {
   char* fn_signature;
 
+  struct process* parent;
+  
   /* Semaphore to track the success of the process */
   struct semaphore init_mutex;
   bool success;
@@ -52,6 +54,7 @@ void userprog_init(void) {
   success = t->pcb != NULL;
   t->pcb->parent_pid = -1; // The main thread should have no parent (Hence a pid of -1)
   sema_init(&t->pcb->wait_sem, 0);
+  list_init(&t->pcb->children);
 
   /* Kill the kernel if we did not succeed */
   ASSERT(success);
@@ -75,6 +78,7 @@ pid_t process_execute(const char* file_name) {
   struct start_process_args* args = malloc(sizeof(struct start_process_args));
   sema_init(&args->init_mutex, 0);
   args->fn_signature = fn_copy;
+  args->parent = thread_current()->pcb;
   args->success = false;
 
   /* Create a new thread to execute FILE_NAME. */
@@ -85,20 +89,11 @@ pid_t process_execute(const char* file_name) {
   /* Since the start_process function loads the pcb in a different kernel thread
     we need to block until we are done loading the process.
   */
-  struct thread* child = thread_find_child(thread_current(), pid);
-  ASSERT(child);
-  /* We will block here until the start_process condition signal us */
   sema_down(&args->init_mutex);
-  if (args->success) {
-    struct thread* cur_thread = thread_current();
-    if (args->success) process_set_child(cur_thread->pcb, child->pcb);
-     /* We have one more child thread that is running so decrement the semaphore */
-    sema_down(&cur_thread->pcb->wait_sem);
-  }
-
+  bool success = args->success;
   /* Clean up the dynamic memory allocated by heap */
   free(args);
-  return args->success ? pid: -1;
+  return success ? pid: TID_ERROR;
 }
 
 /* A thread function that loads a user process and starts it
@@ -142,6 +137,7 @@ static void start_process(void* args_) {
     strlcpy(t->pcb->process_name, t->name, sizeof t->name);
     t->pcb->pid = t->tid; // Set the pid of the process
     sema_init(&t->pcb->wait_sem, 0);
+    list_init(&t->pcb->children);
   }
 
   /* Initialize interrupt frame and load executable. */
@@ -175,6 +171,7 @@ static void start_process(void* args_) {
   }
 
   args->success = success;
+  process_set_child(args->parent, t->pcb);
   sema_up(&args->init_mutex);
 
   /* Start the user process by simulating a return from an
@@ -244,24 +241,25 @@ void function_call_setup(struct function_signature* fs, void** esp) {
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int process_wait(pid_t child_pid) {
-  struct thread* child = thread_find_child(thread_current(), child_pid);
-  if (!child) return EXIT_PROCESS_NOT_FOUND;
-  if (!process_is_child(thread_current(), child_pid)) return EXIT_PROCESS_NOT_FOUND;
-  if (!child->pcb) return EXIT_PROCESS_NOT_FOUND;
+  struct thread* parent = thread_current();
+  struct process* child_pcb = process_find_child(parent->pcb, child_pid);
+  if (!child_pcb) return EXIT_PROCESS_NOT_FOUND;
+  if (!process_is_child(child_pcb, parent->pcb)) return EXIT_PROCESS_NOT_FOUND;
+  if (!child_pcb) return EXIT_PROCESS_NOT_FOUND;
 
   int status = EXIT_PROCESS_FAILURE;
   
   /* See if the process has completed using semaphores */
-  sema_down(&child->pcb->wait_sem);
+  sema_down(&child_pcb->wait_sem);
 
   /* The child, currently a zombie process, returns the status
     to the parent. The parent will then clean up the child.
   */
-  status = child->pcb->exit_status;
+  status = child_pcb->exit_status;
 
   /* Free the PCB of this process */
-  struct process* pcb_to_free = child->pcb;
-  child->pcb = NULL;
+  list_remove_elem(child_pcb, &parent->pcb->children);
+  struct process* pcb_to_free = child_pcb;
   free(pcb_to_free);
 
   return status;
@@ -283,12 +281,12 @@ void process_exit(void) {
   pd = cur->pcb->pagedir;
   if (pd != NULL) {
     /* Correct ordering here is crucial.  We must set
-         cur->pcb->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
+    cur->pcb->pagedir to NULL before switching page directories,
+    so that a timer interrupt can't switch back to the
+    process page directory.  We must activate the base page
+    directory before destroying the process's page
+    directory, or our active page directory will be one
+    that's been freed (and cleared). */
     cur->pcb->pagedir = NULL;
     pagedir_activate(NULL);
     pagedir_destroy(pd);
@@ -296,12 +294,6 @@ void process_exit(void) {
 
   /* Increment semaphore to signal that the process is done */
   sema_up(&cur->pcb->wait_sem);
-
-  /* Here the child becomes a zombie process where its data structs
-    eg PCB, TCB will be cleaned up by parent in the process_wait 
-    syscall
-  */
-  thread_exit();
 }
 
 /* Sets up the CPU for running user code in the current
@@ -620,11 +612,27 @@ static bool install_page(void* upage, void* kpage, bool writable) {
           pagedir_set_page(t->pcb->pagedir, upage, kpage, writable));
 }
 
-/* Set the child of a given process */
-void process_set_child(struct process* parent, struct process* child) { parent->parent_pid = child->pid; }
+/* Set the child of a given process
+  we set the parent_pid field of the child pcb and append the 
+  child to the parent children list 
+ */
+void process_set_child(struct process* parent, struct process* child) { 
+  child->parent_pid = parent->pid;
+  list_push_back(&parent->children, &child->elem);
+}
 
 /* Check if the pid given is a child process of a given process */
-bool process_is_child(struct process* child, struct process* parent) { return child->parent_pid == parent->pid; }
+bool process_is_child(struct process* child, struct process* parent) { 
+  return child->parent_pid == parent->pid;
+}
+
+struct process* process_find_child(struct process* parent, pid_t child_pid) {
+  for (struct list_elem* ele = list_begin(&parent->children); ele != list_end(&parent->children); ele = list_next(ele)) {
+    struct process* t = list_entry(ele, struct process, elem);
+    if (t->pid == child_pid) return t;
+  }
+  return NULL;
+}
 
 /* Returns true if t is the main thread of the process p */
 bool is_main_thread(struct thread* t, struct process* p) { return p->main_thread == t; }
