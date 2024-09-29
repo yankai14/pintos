@@ -2,6 +2,8 @@
 #define USERPROG_PROCESS_H
 
 #include "threads/thread.h"
+#include "threads/synch.h"
+#include <list.h>
 #include <stdint.h>
 
 // At most 8MB can be allocated to the stack
@@ -17,6 +19,12 @@ typedef tid_t pid_t;
 typedef void (*pthread_fun)(void*);
 typedef void (*stub_fun)(pthread_fun, void*);
 
+enum process_exit_status {
+  EXIT_PROCESS_SUCCESS = 0,       // PROCESS completed successfully
+  EXIT_PROCESS_FAILURE = -1,      // General failure
+  EXIT_PROCESS_NOT_FOUND = -2,		// Invalid pid or pid not child of parent process (process calling wait syscall)
+};
+
 /* The process control block for a given process. Since
    there can be multiple threads per process, we need a separate
    PCB from the TCB. All TCBs in a process will have a pointer
@@ -24,9 +32,21 @@ typedef void (*stub_fun)(pthread_fun, void*);
    of the process, which is `special`. */
 struct process {
   /* Owned by process.c. */
-  uint32_t* pagedir;          /* Page directory. */
-  char process_name[16];      /* Name of the main thread */
-  struct thread* main_thread; /* Pointer to main thread */
+	pid_t pid;																		/* pid of the process. pid = tid of the process kernel thread*/
+  uint32_t* pagedir;          									/* Page directory. */
+  char process_name[16];      									/* Name of the main thread */
+  struct thread* main_thread; 									/* Pointer to main thread */
+	pid_t parent_pid;															/* Parent pid of the process */
+	enum process_exit_status exit_status;        	/* Exit status of a process */
+  struct semaphore wait_sem;                 		/* Semaphore. Blocks until all child threads exits */
+	struct list children;													/* Children processes. Different from children threads */
+	struct list_elem elem;												/* List elem */
+};
+
+struct function_signature {
+  char* file_name;
+  char** argv;
+  int argc;
 };
 
 void userprog_init(void);
@@ -35,6 +55,9 @@ pid_t process_execute(const char* file_name);
 int process_wait(pid_t);
 void process_exit(void);
 void process_activate(void);
+void process_set_child(struct process* parent, struct process* child);
+bool process_is_child(struct process* child, struct process* parent);
+struct process* process_find_child(struct process* parent, pid_t child_pid);
 
 bool is_main_thread(struct thread*, struct process*);
 pid_t get_pid(struct process*);

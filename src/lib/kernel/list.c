@@ -227,6 +227,26 @@ struct list_elem* list_pop_front(struct list* list) {
   return front;
 }
 
+/* Wrapper around list_remove, list_pop_front, list_pop_back 
+  This function assumes that the element is within the list provided
+*/
+bool list_remove_elem(struct list_elem* ele, struct list* lst) {
+  bool res = false;
+  if (is_interior(ele)) {
+    list_remove(ele);
+    res = true;
+  }
+  else if (is_head(ele) && &lst->head == ele) {
+    list_pop_front(lst);
+    res = true;
+  }
+  else if (is_tail(ele) && &lst->tail == ele) {
+    list_pop_back(lst);
+    res = true;
+  }
+  return res;
+}
+
 /* Removes the back element from LIST and returns it.
    Undefined behavior if LIST is empty before removal. */
 struct list_elem* list_pop_back(struct list* list) {
