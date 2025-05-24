@@ -6,6 +6,9 @@
 #include "threads/pte.h"
 #include "threads/palloc.h"
 
+#define PD_SIZE 1024  // Number of entries in the page directory
+#define PT_SIZE 1024  // Number of entries in the page table
+
 static void invalidate_pagedir(uint32_t*);
 
 /* Creates a new page directory that has mappings for kernel
@@ -15,7 +18,8 @@ static void invalidate_pagedir(uint32_t*);
 uint32_t* pagedir_create(void) {
   uint32_t* pd = palloc_get_page(0);
   if (pd != NULL)
-    memcpy(pd, init_page_dir, PGSIZE);
+    // Copy over kernel mappings from init_page_dir
+    memcpy(pd, init_page_dir, PGSIZE); // PGSIZE because pd is 32 bits
   return pd;
 }
 
@@ -205,6 +209,53 @@ uint32_t* active_pd(void) {
   uintptr_t pd;
   asm volatile("movl %%cr3, %0" : "=r"(pd));
   return ptov(pd);
+}
+
+/* Given a page directory, create a copy of it */
+uint32_t* pagedir_copy(uint32_t* pd) {
+  /* Create a new page directory */
+  uint32_t* new_pd = pagedir_create();
+  if (new_pd == NULL) return NULL;
+  
+  // Page dir layer
+  for (int i=0; i<PD_SIZE; i++) {
+    uint32_t pde = pd[i];
+    // If the pde is present and is a user page then copy it
+    if ((pde & PTE_P) && (pde & PTE_U)) {
+      // Get the old page table from the page directory entry
+      uint32_t* pt = pde_get_pt(pde);
+      // Allocate an empty page filled with zeros for the new page table from the kernel pool
+      // Since page tables are kernel structures
+      uint32_t* new_pt = palloc_get_page(PAL_ZERO);
+      if (new_pt == NULL) {
+        pagedir_destroy(new_pd);
+        return NULL;
+      }
+      // Page table layer
+      for (int j=0; j<PT_SIZE; j++) {
+        uint32_t pte = pt[j];
+        // If pte is present copy it
+        if (pte & PTE_P) {
+          // Get the old page
+          void* page = pte_get_page(pte);
+          // Allocate a new page from the user pool since these are user space data
+          void* new_page = palloc_get_page(PAL_USER);
+          if (new_page == NULL) {
+            pagedir_destroy(new_pd);
+            return NULL;
+          }
+          // Copy the contents of old page to new page
+          memcpy(new_page, page, PGSIZE);
+
+          new_pt[j] = pte_create_user(new_page, (pte & PTE_W) != 0);
+        }
+      }
+
+      new_pd[i] = pde_create(new_pt);
+    }
+  }
+
+  return new_pd;
 }
 
 /* Seom page table changes can cause the CPU's translation
