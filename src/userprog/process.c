@@ -32,7 +32,18 @@ struct start_process_args {
   bool success;
 };
 
+struct fork_process_args {
+  struct process* parent;
+  struct intr_frame parent_if;
+  
+  /* Semaphore to track the success of the process */
+  struct semaphore fork_mutex;
+  bool success;
+};
+
 static thread_func start_process NO_RETURN;
+static void function_call_setup(struct function_signature *fs, void **esp);
+static thread_func start_fork NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
 bool setup_thread(void (**eip)(void), void** esp);
@@ -65,17 +76,21 @@ void userprog_init(void) {
    before process_execute() returns.  Returns the new process's
    process id, or TID_ERROR if the thread cannot be created. */
 pid_t process_execute(const char* file_name) {
+  // if (!is_user_vaddr(file_name) || pagedir_get_page(thread_current()->pcb->pagedir, file_name) ==  NULL) return -1;
   char* fn_copy;
   pid_t pid;
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page(0);
+  fn_copy = malloc (sizeof (char) * (strlen (file_name) + 1));
   if (fn_copy == NULL)
-    return TID_ERROR;
+    return TID_ERROR; 
   strlcpy(fn_copy, file_name, PGSIZE);
 
   /* Init start_process args. Set the success value to false first and init the monitor construct */
   struct start_process_args* args = malloc(sizeof(struct start_process_args));
+  if (args == NULL) 
+    return -1;
+  
   sema_init(&args->init_mutex, 0);
   args->fn_signature = fn_copy;
   args->parent = thread_current()->pcb;
@@ -84,7 +99,7 @@ pid_t process_execute(const char* file_name) {
   /* Create a new thread to execute FILE_NAME. */
   pid = thread_create(file_name, PRI_DEFAULT, start_process, args);
   if (pid == TID_ERROR)
-    palloc_free_page(fn_copy);
+    free(fn_copy);
 
   /* Since the start_process function loads the pcb in a different kernel thread
     we need to block until we are done loading the process.
@@ -92,6 +107,38 @@ pid_t process_execute(const char* file_name) {
   sema_down(&args->init_mutex);
   bool success = args->success;
   /* Clean up the dynamic memory allocated by heap */
+  free(args);
+  return success ? pid: TID_ERROR;
+}
+
+/* Fork a child process 
+  To fork a child process we need to do the following:
+  1. Copy the virtual address
+*/
+pid_t process_fork(const char* file_name, struct intr_frame* parent_if) {
+  /* Set the current thread as the parent thread */
+  struct thread* parent = thread_current();
+
+  struct fork_process_args* args = malloc(sizeof(struct fork_process_args));
+  if (args == NULL)
+    return TID_ERROR;
+
+  sema_init(&args->fork_mutex, 0);
+  args->parent = thread_current()->pcb;
+  // Copy of parent interrupt frame so that child can continue from the exact same point as the parent
+  // but have its own independent interrupt frame
+  args->parent_if = *parent_if; 
+  args->success = false;
+
+  pid_t pid = thread_create(file_name, PRI_DEFAULT, start_fork, args);
+  if (pid == TID_ERROR) {
+    free(args);
+    return TID_ERROR;
+  }
+
+  /* Wait for child to finish initializing */
+  sema_down(&args->fork_mutex);
+  bool success = args->success;
   free(args);
   return success ? pid: TID_ERROR;
 }
@@ -107,17 +154,20 @@ static void start_process(void* args_) {
 
   // Tokenize the args
   char* argv[ARG_SIZE];
-  char* saveptr = argv;
+  char* saveptr;
   const char* delim = " ";
   char* token = strtok_r(file_name, delim, &saveptr);
   int argc = 0;
   struct function_signature* fs = malloc(sizeof(struct function_signature));
 
-  while (token != NULL) {
+  char* exec_name = malloc(strlen(token) + 1);
+  strlcpy(exec_name, token, strlen(token) + 1); // Safe copy
+
+  argv[argc++] = token;
+  while ((token = strtok_r(NULL, " ", &saveptr)) != NULL)
     argv[argc++] = token;
-    token = strtok_r(NULL, delim, &saveptr);
-  }
-  fs->file_name = file_name;
+  
+  fs->file_name = exec_name;
   fs->argv = argv;
   fs->argc = argc;
 
@@ -134,10 +184,15 @@ static void start_process(void* args_) {
 
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
-    strlcpy(t->pcb->process_name, t->name, sizeof t->name);
+    strlcpy(t->pcb->process_name, argv[0], sizeof t->name);
     t->pcb->pid = t->tid; // Set the pid of the process
     sema_init(&t->pcb->wait_sem, 0);
     list_init(&t->pcb->children);
+
+    // Initialize the file descriptor table
+    for (int i=0; i<FDT_SIZE; i++) {
+      new_pcb->fd_table[i] = NULL;
+    }
   }
 
   /* Initialize interrupt frame and load executable. */
@@ -147,7 +202,6 @@ static void start_process(void* args_) {
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
     success = load(fs->file_name, &if_.eip, &if_.esp);
-    if_.esp = if_.esp - 12;
   }
 
   /* Handle failure with succesful PCB malloc. Must free the PCB */
@@ -163,9 +217,9 @@ static void start_process(void* args_) {
   if (success) function_call_setup(fs, &if_.esp);
 
   /* Clean up. Exit on failure or jump to userspace */
-  palloc_free_page(fs->file_name);
+  free(fs->file_name);
+  free(file_name);
   if (!success) {
-    sema_up(&t->pcb->wait_sem);
     sema_up(&args->init_mutex);
     thread_exit();
   }
@@ -181,6 +235,52 @@ static void start_process(void* args_) {
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
   asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
+  NOT_REACHED();
+}
+
+static void start_fork(void* args_) {
+  struct fork_process_args* args = (struct fork_process_args*) args_;
+  struct thread* t = thread_current();
+  struct process* parent = args->parent;
+
+  struct process* child = malloc(sizeof(struct process));
+  if (child == NULL) {
+    args->success = false;
+    sema_up(&args->fork_mutex);
+    thread_exit();
+  }
+
+  child->pid = t->tid;
+  strlcpy(child->process_name, parent->process_name, sizeof(parent->process_name));
+  child->main_thread = t;
+  child->parent_pid = parent->pid;
+  sema_init(&child->wait_sem, 0);
+  list_init(&child->children);
+  t->pcb = child;
+
+  child->pagedir = pagedir_copy(parent->pagedir);
+  if (child->pagedir == NULL) {
+    free(child);
+    args->success = false;
+    sema_up(&args->fork_mutex);
+    thread_exit();
+  }
+
+  for (int fd=0; fd<FDT_SIZE; fd++) {
+    if (parent->fd_table[fd] != NULL) {
+      child->fd_table[fd] = file_reopen(parent->fd_table[fd]);
+    } else {
+      child->fd_table[fd] = NULL;
+    }
+  }
+
+  struct intr_frame child_if = args->parent_if;
+  child_if.eax = 0;
+
+  args->success = true;
+  sema_up(&args->fork_mutex);
+
+  asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&child_if) : "memory");
   NOT_REACHED();
 }
 
@@ -204,17 +304,22 @@ void function_call_setup(struct function_signature* fs, void** esp) {
     argv_addresses[i] = (char *) *esp;
   }
 
-  // Align stack pointer for 32-bit address alignment (4 bytes)
-  size_t alignment = ((size_t)*esp % 4);
-  if (alignment != 0) {
-    *esp -= alignment;
-    memset(*esp, 0, alignment); // Optionally clear the added space
-  }
+  // Align stack
+  // Simulate how much alignment we need to remove so that 
+  // when we push the fake return address, the alignment is right
+  int diff = sizeof(char *) + sizeof(char *) * fs->argc + sizeof(char **) + sizeof(int *) + sizeof(void *);
+  int alignment = ((int) *esp - diff + sizeof(void *)) % 16;
+  *esp -= alignment < 0 ? alignment + 16 : alignment;
+
+  // Push null sentinel
+  *esp -= sizeof(char *);
+  *((char **) *esp) = NULL;
 
   // Push addresses of arguments (argv[])
-  size_t argv_addresses_size = (fs->argc + 1) * sizeof(char*);
-  *esp -= argv_addresses_size;
-  memcpy(*esp, argv_addresses, argv_addresses_size);
+  for (int i = fs->argc - 1; i >= 0; i--) {
+    *esp -= sizeof(char *);
+    memcpy(*esp, &argv_addresses[i], sizeof(char *));
+  }
 
   // Push argv address
   // 0xbfffffe1
@@ -226,9 +331,8 @@ void function_call_setup(struct function_signature* fs, void** esp) {
   *((int *) *esp) = fs->argc;
 
   // Push return address
-  size_t fake_ra = 0;
-  *esp -= 4;
-  memcpy(*esp, &fake_ra, 4);
+  *esp -= sizeof(void *);
+  *((void **) *esp) = 0;
 }
 
 /* Waits for process with PID child_pid to die and returns its exit status.
@@ -243,9 +347,9 @@ void function_call_setup(struct function_signature* fs, void** esp) {
 int process_wait(pid_t child_pid) {
   struct thread* parent = thread_current();
   struct process* child_pcb = process_find_child(parent->pcb, child_pid);
-  if (!child_pcb) return EXIT_PROCESS_NOT_FOUND;
-  if (!process_is_child(child_pcb, parent->pcb)) return EXIT_PROCESS_NOT_FOUND;
-  if (!child_pcb) return EXIT_PROCESS_NOT_FOUND;
+  if (!child_pcb) return EXIT_PROCESS_FAILURE;
+  if (!process_is_child(child_pcb, parent->pcb)) return EXIT_PROCESS_FAILURE;
+  if (!child_pcb) return EXIT_PROCESS_FAILURE;
 
   int status = EXIT_PROCESS_FAILURE;
   
@@ -258,7 +362,7 @@ int process_wait(pid_t child_pid) {
   status = child_pcb->exit_status;
 
   /* Free the PCB of this process */
-  list_remove_elem(child_pcb, &parent->pcb->children);
+  list_remove_elem(&child_pcb->elem, &parent->pcb->children);
   struct process* pcb_to_free = child_pcb;
   free(pcb_to_free);
 
@@ -274,6 +378,13 @@ void process_exit(void) {
   if (cur->pcb == NULL) {
     thread_exit();
     NOT_REACHED();
+  }
+
+  // Release the executable file
+  if (cur->pcb->executable != NULL) {
+    file_allow_write(cur->pcb->executable);
+    file_close(cur->pcb->executable);
+    cur->pcb->executable = NULL;
   }
 
   /* Destroy the current process's page directory and switch back
@@ -292,8 +403,19 @@ void process_exit(void) {
     pagedir_destroy(pd);
   }
 
+  /* Cleanup fd_table */
+  for (int i=0; i<FDT_SIZE; i++) {
+    if (cur->pcb->fd_table[i] != NULL) {
+      file_close(cur->pcb->fd_table[i]);
+      cur->pcb->fd_table[i] = NULL;
+    }
+  }
+
   /* Increment semaphore to signal that the process is done */
   sema_up(&cur->pcb->wait_sem);
+
+  thread_exit();
+  NOT_REACHED();
 }
 
 /* Sets up the CPU for running user code in the current
@@ -403,6 +525,10 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
     goto done;
   }
 
+  // Deny writes to the executable when running
+  file_deny_write(file);
+  t->pcb->executable = file;
+
   /* Read and verify executable header. */
   if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr ||
       memcmp(ehdr.e_ident, "\177ELF\1\1\1", 7) || ehdr.e_type != 2 || ehdr.e_machine != 3 ||
@@ -472,7 +598,6 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
 done:
   /* We arrive here whether the load is successful or not. */
-  file_close(file);
   return success;
 }
 

@@ -3,6 +3,7 @@
 
 #include "threads/thread.h"
 #include "threads/synch.h"
+#include "threads/interrupt.h"
 #include <list.h>
 #include <stdint.h>
 
@@ -10,6 +11,8 @@
 // These defines will be used in Project 2: Multithreading
 #define MAX_STACK_PAGES (1 << 11)
 #define MAX_THREADS 127
+
+#define FDT_SIZE 128
 
 /* PIDs and TIDs are the same type. PID should be
    the TID of the main thread of the process */
@@ -33,7 +36,9 @@ enum process_exit_status {
 struct process {
   /* Owned by process.c. */
 	pid_t pid;																		/* pid of the process. pid = tid of the process kernel thread*/
+  struct file* executable;                      /* File executable */
   uint32_t* pagedir;          									/* Page directory. */
+  struct file* fd_table[FDT_SIZE];              /* File descriptor table */
   char process_name[16];      									/* Name of the main thread */
   struct thread* main_thread; 									/* Pointer to main thread */
 	pid_t parent_pid;															/* Parent pid of the process */
@@ -52,6 +57,7 @@ struct function_signature {
 void userprog_init(void);
 
 pid_t process_execute(const char* file_name);
+pid_t process_fork(const char* file_name, struct intr_frame* parent_if);
 int process_wait(pid_t);
 void process_exit(void);
 void process_activate(void);
